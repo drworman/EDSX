@@ -1,0 +1,29 @@
+# Conversion output. EDSX writes raw/ and slef/ into the working
+# directory, so a run inside the checkout would otherwise leave a dozen
+# ship files staged for commit. The reference-data cache lives under
+# Documents/EDSX and never lands here, but .cache/ is listed in case an
+# older build or an EDSX_HOME override puts it in the tree.
+.cache/
+raw/
+slef/
+edsx-failures.txt
+
+# Build output
+build/
+dist/
+out/
+*.spec.bak
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

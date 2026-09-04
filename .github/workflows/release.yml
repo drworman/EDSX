@@ -1,0 +1,368 @@
+name: Release
+
+# One single-file binary for three operating systems, plus the script
+# itself. EDSX is stdlib-only: there is no Qt, so none of the LGPL
+# relinking obligation that EDSG and EDLD carry applies here. What the
+# binary does embed is the CPython runtime and the PyInstaller bootloader,
+# and the licence texts for both ship inside every archive from licenses/.
+# See THIRD-PARTY-NOTICES.md before changing how these artefacts are
+# produced.
+#
+# GitHub attaches "Source code (zip)" and "Source code (tar.gz)" to every
+# release by itself, from the tag. Nothing here builds a source archive,
+# and nothing here needs to.
+
+on:
+  push:
+    # Tags are bare YYYYMMDD datestamps with no "v" prefix, so the
+    # filter matches any tag starting with a digit. The verify job below
+    # is what actually rejects a tag that does not match the version file.
+    tags: ["[0-9]*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build artefacts without publishing a release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  verify:
+    name: Verify tag matches the version file
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Versions are YYYYMMDD datestamps; see CONTRIBUTING.md.
+      - id: read
+        name: Read and check the version
+        shell: bash
+        run: |
+          VERSION="$(tr -d '[:space:]' < version)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Version file: ${VERSION}"
+
+          # edsx.py carries no version constant — it reads this same file at
+          # import time — so there is no second source to cross-check. What
+          # is worth confirming is that the interpreter agrees with the file.
+          REPORTED="$(python3 edsx.py --version)"
+          echo "edsx.py reports: ${REPORTED}"
+          if [ "${REPORTED}" != "${VERSION}" ]; then
+            echo "::error::edsx.py reports '${REPORTED}' but the version" \
+                 "file says '${VERSION}'."
+            exit 1
+          fi
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            if [ "${TAG}" != "${VERSION}" ]; then
+              echo "::error::Tag '${TAG}' does not match the version file" \
+                   "('${VERSION}'). Tags are bare datestamps with no 'v'" \
+                   "prefix. Update 'version' or move the tag."
+              exit 1
+            fi
+          fi
+
+      # The selftest is offline, so it can gate the build rather than only
+      # check the artefact afterwards. A broken reference parser fails here
+      # in seconds instead of three matrix jobs later.
+      - name: Selftest on a bare interpreter
+        run: python3 edsx.py --selftest
+
+  build:
+    name: Build (${{ matrix.os }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: windows-latest
+            platform: windows-x86_64
+          - os: macos-latest
+            platform: macos-arm64
+
+    env:
+      BINARY: EDSX
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # PyInstaller is the only build dependency, and EDSX needs
+      # nothing at all at runtime. There are no Qt runtime libraries to
+      # install and no virtual display to arrange.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Build single-file binary
+        run: pyinstaller packaging/edsx.spec --noconfirm --clean
+
+      # --------------------------------------------------------------- #
+      # Code signing. Every step is skipped when its secret is absent, so
+      # forks build successfully without any credentials configured.
+      # --------------------------------------------------------------- #
+
+      - name: Sign Windows binary
+        if: runner.os == 'Windows' && env.CERT != ''
+        env:
+          CERT: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        shell: pwsh
+        run: |
+          $bytes = [Convert]::FromBase64String($env:CERT)
+          $path = Join-Path $env:RUNNER_TEMP "edsx-signing.pfx"
+          [IO.File]::WriteAllBytes($path, $bytes)
+          $signtool = Get-ChildItem `
+            "C:/Program Files (x86)/Windows Kits/10/bin/*/x64/signtool.exe" |
+            Select-Object -Last 1
+          & $signtool.FullName sign /f $path /p $env:CERT_PASSWORD `
+            /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
+            "dist/${{ env.BINARY }}.exe"
+          & $signtool.FullName verify /pa "dist/${{ env.BINARY }}.exe"
+          Remove-Item $path -Force
+
+      # Unlike EDSG there is no .app bundle here: a command-line tool is a
+      # bare Mach-O executable. That changes two things. There are no Qt
+      # plugins loaded at runtime, so no JIT or unsigned-memory
+      # entitlements are needed and packaging/entitlements.plist does not
+      # exist. And a bare executable has nowhere to attach a notarisation
+      # ticket, so there is no stapler step — Gatekeeper checks the ticket
+      # online instead. Notarising still matters: without it the binary is
+      # blocked outright when a browser sets the quarantine attribute.
+      - name: Sign and notarise macOS binary
+        if: runner.os == 'macOS' && env.CERT != ''
+        env:
+          CERT: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/edsx.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$CERT" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+
+          codesign --force --options runtime --timestamp \
+            --sign "$SIGN_IDENTITY" "dist/${{ env.BINARY }}"
+          codesign --verify --strict --verbose=2 "dist/${{ env.BINARY }}"
+
+          ditto -c -k "dist/${{ env.BINARY }}" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$NOTARY_APPLE_ID" --password "$NOTARY_PASSWORD" \
+            --team-id "$NOTARY_TEAM_ID" --wait
+
+          security delete-keychain "$KEYCHAIN"
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/notarize.zip"
+
+      # --------------------------------------------------------------- #
+      # Smoke test: prove the artefact actually starts and still works.
+      # --version proves the process runs; --selftest exercises the
+      # eddb.js parser, module resolution, slot naming and the
+      # mtype-scoped engineering lookup inside the frozen build. It runs
+      # offline, so a release never depends on GitHub raw being up.
+      #
+      # EDSX is built with console=True, so unlike EDSG and EDLD
+      # there is no windowed-stdout problem and all three platforms can
+      # use the same straightforward capture.
+      # --------------------------------------------------------------- #
+
+      - name: Smoke-test the binary (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="dist/${{ env.BINARY }}"
+          chmod +x "$BIN"
+          ACTUAL="$("$BIN" --version)"
+          EXPECTED="${{ needs.verify.outputs.version }}"
+          echo "reported: '$ACTUAL' / expected: '$EXPECTED'"
+          test -n "$ACTUAL" || { echo "::error::No output from the binary."; exit 1; }
+          test "$ACTUAL" = "$EXPECTED"
+          "$BIN" --selftest
+
+      - name: Smoke-test the binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $expected = "${{ needs.verify.outputs.version }}"
+          $exe = "dist/${{ env.BINARY }}.exe"
+
+          $actual = (& $exe --version 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "Binary exited with code $LASTEXITCODE."
+          }
+          Write-Host "reported: '$actual' / expected: '$expected'"
+          if ($actual -ne $expected) {
+            throw "Version mismatch: got '$actual', expected '$expected'."
+          }
+
+          & $exe --selftest
+          if ($LASTEXITCODE -ne 0) {
+            throw "Selftest failed with code $LASTEXITCODE."
+          }
+          Write-Host "OK"
+
+      # A tagged run produces the archives that become release assets.
+      # A manual run does not: GitHub always zips whatever an artefact
+      # step uploads, so building a tar.gz first hands Linux users a
+      # tarball inside a zip for no reason. Uploading the files loose
+      # makes GitHub's own zip the archive.
+      - name: Package artefacts
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.verify.outputs.version }}"
+          STEM="${{ env.BINARY }}-${VERSION}-${{ matrix.platform }}"
+
+          # The CPython and PyInstaller licence texts travel with the
+          # binary that embeds them; see THIRD-PARTY-NOTICES.md.
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            7z a "dist/${STEM}.zip" "./dist/${{ env.BINARY }}.exe" \
+              ./LICENSE ./THIRD-PARTY-NOTICES.md ./licenses
+          else
+            tar -czf "dist/${STEM}.tar.gz" -C dist "${{ env.BINARY }}" \
+              -C .. LICENSE THIRD-PARTY-NOTICES.md licenses
+          fi
+
+          cd dist
+          # Only the archive, never the loose binary sitting beside it.
+          for f in "${STEM}".*; do
+            if command -v sha256sum >/dev/null; then
+              sha256sum "$f" >> "SHA256SUMS-${STEM}.txt"
+            else
+              shasum -a 256 "$f" >> "SHA256SUMS-${STEM}.txt"
+            fi
+          done
+          ls -la
+
+      - name: Collect artefacts (manual run)
+        if: github.ref_type != 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp LICENSE THIRD-PARTY-NOTICES.md dist/
+          cp -R licenses dist/
+          ls -la dist
+
+      # A tagged run publishes the archive and its checksum. The loose
+      # binary sits in dist/ too, and uploading it as well would double
+      # the transfer and put an unlicensed copy in the release.
+      - uses: actions/upload-artifact@v4
+        if: github.ref_type == 'tag'
+        with:
+          name: ${{ env.BINARY }}-${{ matrix.platform }}
+          path: |
+            dist/${{ env.BINARY }}-*
+          if-no-files-found: error
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        if: github.ref_type != 'tag'
+        with:
+          name: ${{ env.BINARY }}-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag' && !inputs.dry_run
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # EDSX is a single stdlib-only file, so anyone who already has
+      # Python needs no binary at all. Shipping the script as its own asset
+      # saves them an 8 MB download. It is checksummed alongside the rest.
+      #
+      # The published copy travels without the version file beside it, so the
+      # placeholder in _VERSION_STAMP is substituted here. This is the same
+      # thing the frozen binary does by bundling `version` as data: the build
+      # carries a copy, the repository keeps exactly one source. The
+      # substitution is asserted rather than assumed — a silent no-op here
+      # would publish a script that reports its version as "unknown".
+      - name: Attach the script itself
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.verify.outputs.version }}"
+          python3 - "$VERSION" <<'PY'
+          import pathlib, sys
+          version = sys.argv[1]
+          src = pathlib.Path("edsx.py").read_text(encoding="utf-8")
+          out, n = src.replace('"@@EDSX_VERSION@@"', f'"{version}"'), None
+          n = src.count('"@@EDSX_VERSION@@"')
+          if n != 1:
+              raise SystemExit(f"expected 1 version placeholder in edsx.py, found {n}")
+          pathlib.Path(f"artifacts/edsx-{version}.py").write_text(out, encoding="utf-8")
+          print(f"stamped edsx-{version}.py")
+          PY
+          cd artifacts
+          sha256sum "edsx-${VERSION}.py" \
+            >> "SHA256SUMS-script.txt"
+
+      - name: Collect checksums
+        run: |
+          cd artifacts
+          cat SHA256SUMS-*.txt > SHA256SUMS.txt || true
+          rm -f SHA256SUMS-*.txt
+          ls -la
+
+      - name: Extract release notes from the changelog
+        id: notes
+        run: |
+          VERSION="${{ needs.verify.outputs.version }}"
+          # Pull the section for this version out of CHANGELOG.md.
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { flag = 1; next }
+            flag && /^## \[/ { exit }
+            flag { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "No changelog entry found for ${VERSION}." > release-notes.md
+          fi
+          cat release-notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          body_path: release-notes.md
+          draft: false
+          # A suffix such as 20260810-rc1 marks a prerelease; a bare
+          # datestamp is a full release.
+          prerelease: ${{ contains(needs.verify.outputs.version, '-') }}
+          fail_on_unmatched_files: true
